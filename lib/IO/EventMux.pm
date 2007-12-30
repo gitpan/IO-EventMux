@@ -2,7 +2,16 @@ package IO::EventMux;
 use strict;
 use warnings;
 
-our $VERSION = '1.01';
+our $VERSION = '1.02';
+
+# TODO: Add support for sending ICMP error events:
+#   Google keywords: "out-of-band"
+#   Man pages: see IP_RECVERR in ip(7)
+#   Functions: Setsockopt on the socket to get it working.
+#              Read errors with recvmsg or recv
+#   Links: http://www.unix.org.ua/orelly/perl/prog3/ch16_05.htm
+#   http://homepages.cwi.nl/~aeb/linux/man2html/man2/socket.2.html
+#   SO_OOBINLINE : http://www.tutorialspoint.com/perl/perl_getsockopt.htm
 
 =head1 NAME
 
@@ -265,13 +274,17 @@ sub _get_event {
     }
 
     $! = 0;
-    # TODO : handle OOB data
+    # FIXME : handle OOB data and exceptions
     my @result = IO::Select->select($self->{readfh}, $self->{writefh},
-        undef, (!defined $timeout || $timeout > 0 ? $timeout : 0));
+        [@{$self->{readfh}}, @{$self->{writefh}}],
+        (!defined $timeout || $timeout > 0 ? $timeout : 0));
+
+    #use Data::Dumper; print Dumper({readeble => $result[0], writeble =>
+    #   $result[1], exception => $result[2]}) if @result > 0;
 
     if (@result == 0) {
         if ($!) {
-            return { type => 'error', error => "get_event(select):$!" };
+            die "Died because of unknown error: $!";
         } elsif ($timeout_fh) {
             return { type => 'timeout', fh => $timeout_fh };
         } else {
@@ -291,13 +304,13 @@ sub _get_event {
 
             my $packederror = getsockopt($fh, SOL_SOCKET, SO_ERROR);
             if(!defined $packederror) {
-                $self->_push_event({ type => 'ready', fh => $fh });
+                $self->push_event({ type => 'ready', fh => $fh });
             } else {
                 my $error = unpack("i", $packederror);
                 if($error == 0) {
-                    $self->_push_event({ type => 'ready', fh => $fh });
+                    $self->push_event({ type => 'ready', fh => $fh });
                 } else {
-                    my $str = "Uknown error code: $error";
+                    my $str;
                     
                     if($error == ECONNREFUSED) {
                         $str = "Connection refused";
@@ -305,10 +318,14 @@ sub _get_event {
                         $str = "Connection timed out";
                     } elsif($error == ECONNRESET) {
                         $str = "Connection reset by peer";
+                    } else {
+                        die "Died because of unknown error code: $error";
                     }
                     
-                    $self->_push_event({ type => 'error',
-                        fh => $fh, error=> "get_event(can_write):$str" });
+                    $self->push_event({ type => 'error',
+                        fh => $fh, error => "get_event(can_write):$str",
+                        error_num => $error,
+                    });
                 }
             }
 
@@ -322,7 +339,7 @@ sub _get_event {
             }
 
         } else {
-            $self->_push_event({ type => 'can_write', fh => $fh });
+            $self->push_event({ type => 'can_write', fh => $fh });
         }
     }
 
@@ -334,17 +351,17 @@ sub _get_event {
             # new connection
             if ($self->{auto_accept}) {
                 my $client = $fh->accept or next;
-                $self->_push_event({ type => 'accepted', fh => $client,
+                $self->push_event({ type => 'accepted', fh => $client,
                         parent_fh => $fh });
                 $self->add($client, %{$self->{fhs}{$fh}{opts}}, Listen => 0);
                 # Set ready as we already sent a connect.
                 $self->{fhs}{$client}{ready} = 1;
             } else {
-                $self->_push_event({ type => 'accepting', fh => $fh });
+                $self->push_event({ type => 'accepting', fh => $fh });
             }
 
         } elsif (!$self->{fhs}{$fh}{auto_read}) {
-            $self->_push_event({ type => 'can_read', fh => $fh });
+            $self->push_event({ type => 'can_read', fh => $fh });
 
         } else {
             $self->_read_all($fh);
@@ -560,77 +577,87 @@ manipulated later with meta()
 =cut
 
 sub add {
-    my ($self, $client, %opts) = @_;
+    my ($self, $fh, %opts) = @_;
 
-    $self->{fhs}{$client}{buffered} = (exists $opts{Buffered} ?
+    $self->{fhs}{$fh}{buffered} = (exists $opts{Buffered} ?
         $opts{Buffered} : $self->{buffered});
 
     # Set return_last if default for the buffering type.
-    if($self->{fhs}{$client}{buffered}[0] eq 'None' or 
-        $self->{fhs}{$client}{buffered}[0] eq 'Split' or 
-        $self->{fhs}{$client}{buffered}[0] eq 'Disconnect') {
-        $self->{fhs}{$client}{return_last} = 1;
+    if($self->{fhs}{$fh}{buffered}[0] eq 'None' or 
+        $self->{fhs}{$fh}{buffered}[0] eq 'Split' or 
+        $self->{fhs}{$fh}{buffered}[0] eq 'Disconnect') {
+        $self->{fhs}{$fh}{return_last} = 1;
     }
 
-    if ($self->{fhs}{$client}{buffered}[0] =~ /^Split|Regexp$/) {
-        if (@{$self->{fhs}{$client}{buffered}} < 3) {
-            $self->{fhs}{$client}{max_read_size} = 1048576;
+    if ($self->{fhs}{$fh}{buffered}[0] =~ /^Split|Regexp$/) {
+        if (@{$self->{fhs}{$fh}{buffered}} < 3) {
+            $self->{fhs}{$fh}{max_read_size} = 1048576;
         } else {
-            (undef, undef, $self->{fhs}{$client}{max_read_size}) =
-                @{$self->{fhs}{$client}{buffered}};
+            (undef, undef, $self->{fhs}{$fh}{max_read_size}) =
+                @{$self->{fhs}{$fh}{buffered}};
         }
     }
 
-    $self->{fhs}{$client}{auto_accept} = (exists $opts{ManualAccept} ?
+    $self->{fhs}{$fh}{auto_accept} = (exists $opts{ManualAccept} ?
         !$opts{ManualAccept} : $self->{auto_accept});
 
-    $self->{fhs}{$client}{auto_write} = (exists $opts{ManualWrite} ?
+    $self->{fhs}{$fh}{auto_write} = (exists $opts{ManualWrite} ?
         !$opts{ManualWrite} : $self->{auto_write});
 
-    $self->{fhs}{$client}{auto_read} = (exists $opts{ManualRead} ?
+    $self->{fhs}{$fh}{auto_read} = (exists $opts{ManualRead} ?
         !$opts{ManualRead} : $self->{auto_read});
 
-    $self->{fhs}{$client}{read_size} = (exists $opts{ReadSize} ?
+    $self->{fhs}{$fh}{read_size} = (exists $opts{ReadSize} ?
         $opts{ReadSize} : $self->{read_size});
 
-    if ($self->{fhs}{$client}{auto_read} 
-        || $self->{fhs}{$client}{auto_write} || $opts{Listen}) {
-        $self->nonblock($client);
+    if ($self->{fhs}{$fh}{auto_read} 
+        || $self->{fhs}{$fh}{auto_write} || $opts{Listen}) {
+        $self->nonblock($fh);
     }
     
-    $self->{fhs}{$client}{meta} = $opts{Meta} if exists $opts{Meta};
+    $self->{fhs}{$fh}{meta} = $opts{Meta} if exists $opts{Meta};
 
-    $self->{listenfh}{$client} = 1 if $opts{Listen};
+    $self->{listenfh}{$fh} = 1 if $opts{Listen};
     
-    $self->{readfh}->add($client);
+    $self->{fhs}{$fh}{type} = 'stream';
 
-    # If this is not UDP(SOCK_DGRAM) send a ready event.
-    if ((!UNIVERSAL::can($client, "socktype") 
-            or ($client->socktype || 0) != SOCK_DGRAM)) {
-        #TODO Only works on IO::Socket, change to use a socktype that works for
-        # all kind of filehandles.
-
-        # Add to find out when to send ready event.
-        if (!$opts{Listen}) {
-            $self->{writefh}->add($client);
-            $self->{fhs}{$client}{ready} = 0;
+    my $type = getsockopt($fh, SOL_SOCKET, SO_TYPE);
+    $type = unpack("S", $type) if defined $type;
+    # Check if it's a socket and not a pipe
+    if(defined $type) {
+        $self->{fhs}{$fh}{class} = 'socket';
+        
+        if($type == SOCK_STREAM) { # type = 1
+            # Add to find out when to send ready event.
+            if (!$opts{Listen}) {
+                $self->{writefh}->add($fh);
+                $self->{fhs}{$fh}{ready} = 0;
+            }
+        } elsif($type == SOCK_DGRAM or $type == SOCK_RAW) { # type = 2,3
+            $self->{fhs}{$fh}{type} = 'dgram';
+            
+        } else {
+            croak "Unknown socket type: $type";
         }
-    
-    } else {
-        $self->{fhs}{$client}{type} = 'dgram';
-    }
 
-    $self->{fhs}{$client}{type} = (exists $opts{Type} ?
-        $opts{Type} : $self->{type});
+    } else {
+        $self->{fhs}{$fh}{class} = 'other';
+        $self->{writefh}->add($fh);
+        $self->{fhs}{$fh}{ready} = 0;
+    }
+    
+    $self->{readfh}->add($fh);
+    
+    $self->{fhs}{$fh}{type} =  $opts{Type} if exists $opts{Type};
 
     # Save %opts, so we can given the to $fh->accept() children.
-    $self->{fhs}{$client}{opts} = \%opts;
-    $self->{fhs}{$client}{inbuffer} = '';
+    $self->{fhs}{$fh}{opts} = \%opts;
+    $self->{fhs}{$fh}{inbuffer} = '';
     
-    if($self->{fhs}{$client}{type} eq 'dgram') {
-        @{$self->{fhs}{$client}{outbuffer}} = ();
+    if($self->{fhs}{$fh}{type} eq 'dgram') {
+        @{$self->{fhs}{$fh}{outbuffer}} = ();
     } else {
-        $self->{fhs}{$client}{outbuffer} = '';
+        $self->{fhs}{$fh}{outbuffer} = '';
     }
 }
 
@@ -643,6 +670,28 @@ Returns a list of file handles managed by this object.
 sub handles {
     my ($self) = @_;
     return $self->{readfh}->handles;
+}
+
+=head2 B<type()>
+
+Returns the socket type for a file handle
+
+=cut
+
+sub type {
+    my ($self, $fh) = @_;
+    return $self->{fhs}{$fh}{type};
+}
+
+=head2 B<class()>
+
+Returns the socket class for a file handle
+
+=cut
+
+sub class {
+    my ($self, $fh) = @_;
+    return $self->{fhs}{$fh}{class};
 }
 
 =head2 B<meta($fh, [$newval])>
@@ -695,16 +744,16 @@ final 'closed' event is returned.
 sub close {
     my ($self, $fh) = @_;
 
-    return undef if $self->{fhs}{$fh}{disconnecting};
+    return if $self->{fhs}{$fh}{disconnecting};
     $self->{fhs}{$fh}{disconnecting} = 1;
     
     if(exists $self->{listenfh}{$fh}) {
         delete $self->{listenfh}{$fh};
-        $self->_push_event({ type => 'closing', fh => $fh });
+        $self->push_event({ type => 'closing', fh => $fh });
         
         # wait with the close so a valid file handle can be returned
         push @{$self->{actionq}}, sub {
-            $self->_push_event({ type => 'closed', fh => $fh });
+            $self->push_event({ type => 'closed', fh => $fh });
             $self->_close_fh($fh);
         };
     
@@ -713,7 +762,7 @@ sub close {
         
         if($self->buflen($fh) == 0) {
             $self->{writefh}->remove($fh);
-            $self->_push_event({ type => 'closing', fh => $fh });
+            $self->push_event({ type => 'closing', fh => $fh });
                         
             # wait with the close so a valid file handle can be returned
             push @{$self->{actionq}}, sub {
@@ -740,7 +789,7 @@ sub kill {
     $self->{readfh}->remove($fh);
     $self->{writefh}->remove($fh);
 
-    $self->_push_event({ type => 'closed', fh => $fh, 
+    $self->push_event({ type => 'closed', fh => $fh, 
             missing => $self->buflen($fh) });
     
     $self->_close_fh($fh);
@@ -797,7 +846,7 @@ wait until the buffer queue is a bit shorter.
 
 sub buflen {
     my ($self, $fh) = @_;
-    my $meta = $self->{fhs}{$fh};
+    my $meta = $self->{fhs}{$fh} or croak "$fh not handled by EventMux";
 
     if ($meta->{type} eq "dgram") {
         return $meta->{outbuffer} ? scalar(@{$meta->{outbuffer}}) : 0;
@@ -813,7 +862,7 @@ off (default).
 
 =over
 
-=item If the socket is of Type="stream" (default)
+=item If the socket is of Type="stream"
 
 Returns true on success, undef on error. The data is sent when the socket
 becomes unblocked and a 'sent' event is posted when all data is sent and the 
@@ -849,15 +898,15 @@ sub sendto {
 
     if (not defined $fh) {
         carp "send() on an undefined file handle";
-        return undef;
+        return;
     }
 
-    my $cfg = $self->{fhs}{$fh} or return undef;
-    return undef if $cfg->{disconnecting};
+    my $cfg = $self->{fhs}{$fh} or return;
+    return if $cfg->{disconnecting};
 
     if (not $cfg->{auto_write}) {
         carp "send() on a ManualWrite file handle";
-        return undef;
+        return;
     }
 
     if ($cfg->{type} eq "dgram") {
@@ -875,7 +924,7 @@ sub sendto {
 
 sub _send_dgram {
     my ($self, $fh) = @_;
-    my $cfg = $self->{fhs}{$fh} or return undef;
+    my $cfg = $self->{fhs}{$fh} or return;
     
     my $packets_sent = 0;
 
@@ -889,10 +938,9 @@ sub _send_dgram {
                 unshift @{$cfg->{outbuffer}}, $queue_item;
                 return $packets_sent;
             } else {
-                $self->_push_event({ type => 'error', error => "send_dgram:$!", 
-                    fh => $fh });
+                die "Died because of unknown error: $!";
             }
-            return undef;
+            return;
 
         } elsif ($rv < length $data) {
             die "Incomplete datagram sent (should not happen)";
@@ -904,11 +952,11 @@ sub _send_dgram {
     }
     
     
-    $self->_push_event({type => 'sent', fh => $fh});
+    $self->push_event({type => 'sent', fh => $fh});
     $self->{writefh}->remove($fh);
     
     if($self->{fhs}{$fh}{disconnecting}) {
-        $self->_push_event({ type => 'closing', fh => $fh });
+        $self->push_event({ type => 'closing', fh => $fh });
                         
         # wait with the close so a valid file handle can be returned
         push @{$self->{actionq}}, sub {
@@ -921,7 +969,7 @@ sub _send_dgram {
 
 sub _send_stream {
     my ($self, $fh) = @_;
-    my $cfg = $self->{fhs}{$fh} or return undef;
+    my $cfg = $self->{fhs}{$fh} or return;
 
     if ($cfg->{outbuffer} eq '') {
         # no data to send
@@ -931,23 +979,21 @@ sub _send_stream {
 
     my $rv = $self->_my_send($fh, $cfg->{outbuffer});
     
-    # send pending data before this
-    
-    if (!defined $rv) {
+    # Check for undef or -1 as both can be error retvals 
+    if (!defined $rv or $rv < 0) {
         if ($! == POSIX::EWOULDBLOCK or $! == POSIX::EAGAIN) {
-            return undef;
+            return;
         
         } else {
-            $self->_push_event({ type => 'error', error => "send_stream:$!", 
-                fh => $fh });
+            if($! =~ /Bad file descriptor/) {
+                #use Data::Dumper; print Dumper($self->{fhs});
+                die "Died because IO::Eventmux was passed a: $!";
+            } else {
+                die "Died because of unknown error: $!";
+            }
         }
         
-        return undef;
-
-    } elsif ($rv < 0) {
-        $self->_push_event({ type => 'error', error => "send_stream:$!", 
-            fh => $fh });
-        return undef;
+        return;
 
     } elsif ($rv < length $cfg->{outbuffer}) {
         # only part of the data was sent
@@ -957,11 +1003,11 @@ sub _send_stream {
     } else {
         # all pending data was sent
         $cfg->{outbuffer} = '';
-        $self->_push_event({type => 'sent', fh => $fh});
+        $self->push_event({type => 'sent', fh => $fh});
         $self->{writefh}->remove($fh);
 
         if($self->{fhs}{$fh}{disconnecting}) {
-            $self->_push_event({ type => 'closing', fh => $fh });
+            $self->push_event({ type => 'closing', fh => $fh });
                         
             # wait with the close so a valid file handle can be returned
             push @{$self->{actionq}}, sub {
@@ -986,8 +1032,69 @@ sub _my_send {
     return $@ ? undef : $rv;
 }
 
-sub _push_event {
-    push @{$_[0]->{events}}, $_[1];
+# rv can be sender or undef, error is 0 on tcp shutdown
+sub _my_read {
+    my ($self, $fh, $read_size, $flags) = @_;
+
+    my $rv; my $data; my $error; my $type;
+    $! = undef;
+    $@ = undef;
+    if (UNIVERSAL::can($fh, "recv") and !$fh->isa("IO::Socket::SSL")) {
+        $rv = eval { $fh->recv($data, $read_size, ($flags or 0)) };
+        $type = 'recv';
+    } else {
+        $rv = eval { sysread $fh, $data, $read_size };
+        $type = 'sysread';
+    }
+    
+    # Check for errors in read
+    if($! or $@ or !defined $rv or ($rv =~ /^\d+$/ and $rv <= 0)) { 
+        if($! == EWOULDBLOCK) { 
+            $error = EWOULDBLOCK;
+
+        # Try to get socket errors if it's a socket we are dealing with.
+        } elsif($self->{fhs}{$fh}{class} eq 'socket') {
+            my $packederror = getsockopt($fh, SOL_SOCKET, SO_ERROR);
+            $error = unpack("i", $packederror) if defined $packederror;
+        }
+        
+        #if(defined $error and $error == 0) {
+        #    use Data::Dumper; print Dumper({ 
+        #        error => $error, '$!' => $!, '$@' => $@, rv => $rv, 
+        #        type => $type, val => ECONNRESET, 
+        #    });
+        #}
+
+        if(defined $error and $error != 0) {
+            # We could get an error from getsockopt
+        } elsif($! =~ /Connection refused/) {
+            $error = ECONNREFUSED;
+        } elsif($! =~ /Connection timed out/) {
+            $error = ETIMEDOUT;
+        } elsif($! =~ /Connection reset by peer/) {
+            $error = ECONNRESET;
+        } else {
+            $error = 0; 
+        }
+
+    } elsif($rv eq "" or $rv =~ /^\d$/) {
+        $rv = undef;
+    }
+
+    return ($rv, $data, $error);
+}
+
+
+
+=head2 B<push_event($event)> 
+
+Puts socket into nonblocking mode.
+
+=cut
+
+sub push_event {
+    my($self, @events) = @_;
+    push @{$_[0]->{events}}, @events;
 }
 
 =head2 B<nonblock($socket)> 
@@ -1037,23 +1144,37 @@ sub _read_all {
                 }
             }
 
-            my ($data, $rv) = ('');
-            if (UNIVERSAL::can($fh, "recv") and !$fh->isa("IO::Socket::SSL")) {
-                $rv = $fh->recv($data, $read_size, 0);
-                $sender = $rv if defined $rv && $rv ne "";
-            } else {
-                $rv = sysread $fh, $data, $read_size;
-            }
-
-            if (not defined $rv) {
-                if ($! != POSIX::EWOULDBLOCK) {
-                    $self->_push_event({ type => 'error', 
-                            error => "read_all:$!", fh => $fh });
+            my ($rv, $data, $error) = $self->_my_read($fh, $read_size, 0);
+            if ($error) {
+                my $str;
+                if ($error == EWOULDBLOCK) {
+                    $canread = 0;
+                    last READ;
+                
+                } elsif($error == ECONNREFUSED) {
+                    $str = "Connection refused";
+                } elsif($error == ETIMEDOUT) {
+                    $str = "Connection timed out";
+                } elsif($error == ECONNRESET) {
+                    $str = "Connection reset by peer";
+                } elsif ($! =~ /Bad file descriptor/) {
+                    die "Died because IO::EventMux was passed a $!";
+                } else {
+                    die "Died because of unknown error code: $error, $!";
                 }
+                    
+                $self->push_event({ type => 'error', 
+                    error => "read_all:$str", error_num => $error,
+                    fh => $fh,
+                });
+
                 $canread = 0;
                 last READ;
+            
+            } elsif(defined $rv) {
+                $sender = $rv;
             }
-
+            
             if (length $data == 0 and $cfg->{type} eq "stream") {
                 # client disconnected
                 $disconnected = 1;
@@ -1088,17 +1209,24 @@ sub _read_all {
 
         if($buffertype eq 'Size') {
             my ($pattern, $offset) = (@args, 0); # Defaults to 0 if no offset
-            my $length = 
-            (unpack($pattern, $cfg->{inbuffer}))[0]+$offset;
-
+            # FIXME: Check that we have enough data to do the unpack.
+            #        eg. length(pack($pattern, 30 x (1))); # remember to check
+            #        for * elements.
+            #
+            my $length = (unpack($pattern, $cfg->{inbuffer}))[0]+$offset;
             my $datastart = length(pack($pattern, $length));
-
+             
             while($length <= length($cfg->{inbuffer})) {
                 my %copy = %event;
                 $copy{'data'} = substr($cfg->{inbuffer},
                     $datastart, $length);
                 substr($cfg->{inbuffer}, 0, $length+$datastart) = '';
-                $self->_push_event(\%copy);
+                $self->push_event(\%copy);
+                
+                if(length $cfg->{inbuffer} > 0) {
+                    $length = (unpack($pattern, $cfg->{inbuffer}))[0]+$offset;
+                    $datastart = length(pack($pattern, $length));
+                }
             }
 
         } elsif($buffertype eq 'FixedSize') {
@@ -1108,7 +1236,7 @@ sub _read_all {
                 my %copy = %event;
                 $copy{'data'} = substr($cfg->{inbuffer}, 0, $length);
                 substr($cfg->{inbuffer}, 0, $length) = '';
-                $self->_push_event(\%copy);
+                $self->push_event(\%copy);
             }
 
         } elsif($buffertype eq 'Split') {
@@ -1118,7 +1246,7 @@ sub _read_all {
                 if($1 ne '') {
                     my %copy = %event;
                     $copy{'data'} = $1;
-                    $self->_push_event(\%copy);
+                    $self->push_event(\%copy);
                 }
             }
 
@@ -1129,16 +1257,43 @@ sub _read_all {
                 if($1 ne '') {
                     my %copy = %event;
                     $copy{'data'} = $1;
-                    $self->_push_event(\%copy);
+                    $self->push_event(\%copy);
+                }
+            }
+        
+        } elsif($buffertype eq 'HTTP') {
+            if(exists $cfg->{length}) {
+               if(length $cfg->{inbuffer} >= $cfg->{length}) {
+                    my %copy = %event;
+                    $copy{data} = substr($cfg->{inbuffer}, 0, $cfg->{length});;
+                    substr($cfg->{inbuffer}, 0, $cfg->{length}) = '';
+                    $self->push_event(\%copy);
+               }
+
+            } else {
+                my $idx = index($cfg->{inbuffer}, "\r\n\r\n");
+            
+                # Found what could be a header
+                if($idx > 0) {
+                    my $header = substr($cfg->{inbuffer}, 0, $idx + 4);;
+                    if($header =~ /Content-Length:\s+(\d+)/) {
+                        $cfg->{length} = $1 + $idx + 4;
+                    } else {
+                        my %copy = %event;
+                        $copy{data} = $header;
+                        substr($cfg->{inbuffer}, 0, $idx + 4) = '';
+                        $self->push_event(\%copy);
+                    }
                 }
             }
 
         } elsif($buffertype eq 'Disconnect') {
 
+        
         } elsif($buffertype eq 'None') {
             $event{'data'} = $cfg->{inbuffer};
             $cfg->{inbuffer} = '';
-            $self->_push_event(\%event);
+            $self->push_event(\%event);
 
         } else {
             die("Unknown Buffered type: $buffertype");
@@ -1154,7 +1309,7 @@ sub _read_all {
 
     if ($cfg->{max_read_size}
             and length $cfg->{inbuffer} >= $cfg->{max_read_size}) {
-        $self->_push_event({ type => 'error', fh => $fh, 
+        $self->push_event({ type => 'error', fh => $fh, 
                 error => "Buffer size exceeded"});
         $cfg->{return_last} = 0; # last chunk is incomplete
         $disconnected = 1;
@@ -1164,17 +1319,17 @@ sub _read_all {
         # Return the last bit of buffer to the user when we get a disconnect.
         if(length($cfg->{inbuffer}) > 0) {
             if($cfg->{return_last}) {
-                $self->_push_event({ type => 'read', fh => $fh, 
+                $self->push_event({ type => 'read', fh => $fh, 
                         data => $cfg->{inbuffer}});
             } else {
-                $self->_push_event({ type => 'read_last', fh => $fh, 
+                $self->push_event({ type => 'read_last', fh => $fh, 
                         data => $cfg->{inbuffer}});
             }
             $cfg->{inbuffer} = '';
         }
 
         if($disconnected) {
-            $self->_push_event({ type => 'closing', fh => $fh });
+            $self->push_event({ type => 'closing', fh => $fh });
 
             # wait with the close so a valid file handle can be returned
             push @{$self->{actionq}}, sub {
@@ -1199,4 +1354,3 @@ it under the same terms as Perl itself.
 
 =cut
 
-# vim: et sw=4 sts=4 tw=80

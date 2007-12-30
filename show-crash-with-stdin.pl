@@ -26,7 +26,7 @@ if ($pid == 0) {
     open STDOUT, ">&", $writerOUT or die;
     open STDERR, ">&", $writerERR or die;
     open STDIN, ">&", $readerIN or die;
-    exec "sh", "-c", q(cat);
+    exec "tftp";
     die;
 }
 
@@ -41,43 +41,18 @@ print "OUT($readerOUT)\n";
 print "ERR($readerERR)\n";
 print "IN($writerIN)\n";
 
-my $dataIN = "hello\n" x 1;
-my $dataOUT = '';
-my $dataERR = '';
 
-my $closed = 0;
 while (my $event = $mux->mux) {
     print "Got event: $event->{type} : $event->{fh} \n";
-
-    if ($event->{type} eq "ready" and ($event->{fh} == $writerIN)) {
-        $mux->send($event->{fh}, $dataIN);
-
-    } elsif ($event->{type} eq "read" and ($event->{fh} == $readerOUT)) {
-        $dataOUT .= $event->{data};
-        if(length($dataIN)-1 == length($dataOUT)) {
-            $mux->kill($writerIN);
-        }
+    print "OUT:$event->{data}\n" if $event->{type} eq 'read';
     
-    } elsif ($event->{type} eq "read" and ($event->{fh} == $readerERR)) {
-        $dataERR .= $event->{data};
-    
-    } elsif ($event->{type} eq "closed" and ($event->{fh} == $readerOUT)) {
-        print "OUT:$dataOUT\n";
+    if($event->{type} eq 'ready') {
+        $mux->send($event->{fh}, "quit\n");
+    }
 
-        if($closed++) {
-            waitpid $pid, 0;
-            print "Exit status: $?\n";
-            last;
-        }
-    
-    } elsif ($event->{type} eq "closed" and ($event->{fh} == $readerERR)) {
-        print "ERR:$dataERR\n";
-        
-        if($closed++) {
-            waitpid $pid, 0;
-            print "Exit status: $?\n";
-            last;
-        }
+    if($event->{error}) {
+        sleep 100;
+        exit;
     }
 }
 
