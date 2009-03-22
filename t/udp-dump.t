@@ -2,7 +2,7 @@ use strict;
 use warnings;
 
 use Test::More tests => 1;
-use IO::EventMux;
+use IO::EventMux::Dump;
 use IO::Socket::INET;
 use IO::Select;
 use Socket;
@@ -16,10 +16,8 @@ my $fh = IO::Socket::INET->new(
     Blocking     => 0,
 ) or die "Could not open socket on (127.0.0.1:10045): $!\n";
 
-my $mux = IO::EventMux->new();
+my $mux = IO::EventMux::Dump->new();
 $mux->add($fh);
-
-my $count = 20000;
 
 my $pid = fork;
 if($pid == 0) {
@@ -28,22 +26,21 @@ if($pid == 0) {
         PeerAddr => '127.0.0.1',
         PeerPort => 10045,
         Proto    => 'udp',
-        Blocking => 1,
+        Blocking => 0,
     ) or die "Could not open socket on 127.0.0.1 : $!\n";
-    for(my $i=0;$i<$count;$i++) {
-        $fh->send("hello\n");
-        $fh->recv(my $inData, 512, 0);
-    }
+    $fh->send("hello\n");
     close $fh;
     exit;
 }
 
 while (my $event = $mux->mux()) {
-    if($event->{type} eq 'read') {
-        $mux->send($fh, $event->{data});
-        if(--$count == 0) { exit; }
-        #print "$count\n";
+    use Data::Dumper; print Dumper($event);
+    if($event->{type} eq 'read' and $event->{data} eq "hello\n") {
+        pass("Socket was detected as UDP and we got our data");
+    } else {
+        fail("Socket was not detected as UDP or we did not get the right data");
     }
+    exit;
 }
 
 waitpid($pid, 0);

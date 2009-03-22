@@ -1,8 +1,11 @@
 use strict;
 use warnings;
 
+# FIXME: Rewrite so it does not fail on *BSD or when the machine is slow. 
+
 use Test::More tests => 9;
 use IO::EventMux;
+use IO::Buffered;
 
 my $mux = IO::EventMux->new(ReadPriorityType => ['FairByEvent']);
 
@@ -21,7 +24,7 @@ sub create_writer {
 
     close $writerOUT;
     $mux->add($readerOUT, 
-        Buffered => ["Split", qr/\n/],
+        Buffered => new IO::Buffered(Split => qr/\n/),
         ReadSize => 4,
         Meta => { pid => $pid },
     );
