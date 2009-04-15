@@ -44,7 +44,7 @@ use Carp qw(carp cluck croak);
 #
 
 
-our $VERSION = '2.00';
+our $VERSION = '2.01';
 
 =head1 NAME
 
@@ -91,6 +91,15 @@ use POSIX qw(strerror);
 
 use Scalar::Util qw(blessed);
 
+# Define EPOLL constants as this needs to be done at compile time
+use constant EPOLLIN       => 1;
+use constant EPOLLOUT      => 4;
+use constant EPOLLERR      => 8;
+use constant EPOLLHUP      => 16;
+use constant EPOLL_CTL_ADD => 1;
+use constant EPOLL_CTL_DEL => 2;
+use constant EPOLL_CTL_MOD => 3;
+
 # Make nice fallback for socket_errors usage
 eval "use IO::EventMux::Socket::MsgHdr qw(socket_errors);"; ## no critic
 if($@) {
@@ -112,16 +121,114 @@ my %allowed_add_opts = map { $_ => 1 } qw(
     Meta MetaHandler
 );
 
-=head2 B<new()>
+=head2 B<new([%options])>
 
 Constructs an IO::EventMux object.
+
+The optional parameters for the handle will be taken from the IO::EventMux
+object if not given here:
+
+=cut
+
+=head3 EventLoop
+
+Defines what mechanism to use for the event loop, currently only two build in
+are available; L<IO::Epoll> and L<IO::Select>. IO::Select being the default.
+
+  my $mux = new IO::EventMux(EventLoop => [$mechanism, $args]);
+
+IO::Epoll example for holding 1024 file handles:
+
+  my $mux = new IO::EventMux(EventLoop => ["IO::Epoll", 1024]);
+
+It's also possible to define your own, this is done by creating a hash that
+implements the following structure:
+
+  my $mux = new IO::EventMux(EventLoop => {
+      Add => sub { 
+        my($self, $list, $fh) = @_;
+        ...
+      },
+      Wait => sub {
+        my($self, $timeout) = @_;
+        ...
+        return {
+            can_read => [$fh, ...],
+            can_write => [$fh, ...],
+        };
+        
+      },
+      Remove => sub {
+        my($self, $list, $fh) = @_;
+        ...
+      },
+      Handles => sub {
+        my($self) = @_;
+        ...
+      },
+  });
 
 =cut
 
 sub new {
     my ($class, %opts) = @_;
-    
-    bless {
+
+    $opts{EventLoop} = ['IO::Epoll', 1024];
+
+    my %eventloopvars;
+    if(my $eventloop = $opts{EventLoop}) {
+        # FIXME: Make test for IO::Epoll
+        if(ref $eventloop eq 'HASH') {
+            *_eventloop_wait = \$eventloop->{Wait};
+            *_eventloop_add = \$eventloop->{Add};
+            *_eventloop_remove = \$eventloop->{Remove};
+            *handles = \$eventloop->{Handles};
+            %eventloopvars = %{$eventloop->{Vars}};
+       
+        } elsif(ref $eventloop eq 'ARRAY') {
+            my ($type, @args) = @{$eventloop};
+
+            if($type eq 'IO::Epoll') {
+                require IO::Epoll;
+                *epoll_create = *IO::Epoll::epoll_create;
+                *epoll_ctl = *IO::Epoll::epoll_ctl;
+                *epoll_wait = *IO::Epoll::epoll_wait;
+                
+                *_eventloop_wait = *_eventloop_wait_epoll;
+                *_eventloop_add = *_eventloop_add_epoll;
+                *_eventloop_remove = *_eventloop_remove_epoll;
+                *handles = *_eventloop_handles_epoll;
+
+                %eventloopvars = (    
+                    epollfd =>  epoll_create($args[0]),
+                    fds => {},
+                ); 
+            
+            } elsif($type eq 'IO::Select') {
+                goto EVENTLOOP_IO_SOCKET;
+            
+            } else {
+                croak "Unsupport Eventloop type: $type";
+            }
+        
+        } else {
+            croak "EventLoop variriable needs to Array or Hash";
+        }
+
+    } else { #EVENTLOOP_IO_SOCKET:
+        *_eventloop_wait = *_eventloop_wait_select;
+        *_eventloop_add = *_eventloop_add_select;
+        *_eventloop_remove = *_eventloop_remove_select;
+        *handles = *_eventloop_handles_select;
+        %eventloopvars = (    
+            readfh        => IO::Select->new(),
+            writefh       => IO::Select->new(),
+        ); 
+    }
+
+    return bless {
+        %eventloopvars,
+
         # GLOBAL
         auto_accept   => 1,
         auto_write    => 1,
@@ -130,8 +237,6 @@ sub new {
         errors        => 0,
         read_size     => 65536,
         
-        readfh        => IO::Select->new(),
-        writefh       => IO::Select->new(),
         fhs           => { },
         sessions      => { },
         listenfh      => { },
@@ -143,6 +248,7 @@ sub new {
         return_last   => 0,
         type          => 'stream',
         class         => 'socket',
+
     }, $class;
 }
 
@@ -259,8 +365,10 @@ sub mux {
 
 sub _get_event {
     my ($self, $timeout) = @_;
-    
-    my $select = $self->_io_select($timeout);
+   
+    # TODO: with EPOLL we get fh errors as events, EPOLLERR 
+    #       use this to be smarter about how we handle them
+    my $select = _eventloop_wait($self, $timeout);
     if(!$select) {
         $self->push_event({ type => 'timeout' });
         return;
@@ -338,7 +446,22 @@ sub _get_event {
     }
 }
 
-sub _io_select {
+sub _eventloop_handles_select {
+    my ($self) = @_;
+    return $self->{readfh}->handles;
+}
+
+sub _eventloop_add_select {
+    my ($self, $list, $fh) = @_;
+    $self->{$list}->add($fh);
+}
+
+sub _eventloop_remove_select {
+    my ($self, $list, $fh) = @_;
+    $self->{$list}->remove($fh);
+}
+
+sub _eventloop_wait_select {
     my ($self, $timeout) = @_;
 
     $! = 0;
@@ -356,11 +479,114 @@ sub _io_select {
         };
     } else {
         if ($!) {
-            die "Died because of unknown error: $!";
+            die "Died because of error in IO::Select: $!";
         }
         return;
     }
 }
+
+
+sub _eventloop_handles_epoll {
+    my ($self) = @_;
+
+    return map { $_->[0] } values %{$self->{fds}};
+}
+
+sub _dumpflags {
+    my @flags;
+    push(@flags, "EPOLLIN") if EPOLLIN & $_[0];
+    push(@flags, "EPOLLOUT") if EPOLLOUT & $_[0];
+    push(@flags, "EPOLLERR") if EPOLLERR & $_[0];
+    push(@flags, "EPOLLHUP") if EPOLLHUP & $_[0];
+    return join("|", @flags);
+}
+
+sub _eventloop_add_epoll {
+    my ($self, $list, $fh) = @_;
+    my $fd = fileno $fh;
+    $self->{fhs}{$fh}{fd} = $fd;
+
+    #my ($package, $filename, $line, $subroutine, $hasargs, $wantarray, 
+    #    $evaltext, $is_require, $hints, $bitmask, $hinthash) = caller(0);
+
+    my $mask = $list eq 'writefh' ? EPOLLOUT : EPOLLIN;
+  
+    $mask |= EPOLLERR|EPOLLHUP; 
+
+    if(my $cfd = $self->{fds}{$fd}) {
+        $mask |= $cfd->[1];
+        #print "modadd: $package\::$subroutine $line : $fh : "._dumpflags($mask)."\n";
+        epoll_ctl($self->{epollfd}, EPOLL_CTL_MOD, $fd, $mask) >= 0 
+            or croak("->add($fh, ...) : epoll_ctl($self->{epollfd}, "
+            ."EPOLL_CTL_MOD, $fd, $mask): $!\n");
+    } else {
+        #print "add: $package\::$subroutine $line : $fh : "._dumpflags($mask)."\n";
+        epoll_ctl($self->{epollfd}, EPOLL_CTL_ADD, $fd, $mask) >= 0 
+            or croak("->add($fh, ...) : epoll_ctl($self->{epollfd}, "
+            ."EPOLL_CTL_ADD, $fd, $mask): $!\n");
+    }
+
+    $self->{fds}{$fd} = [$fh, $mask];
+}
+
+sub _eventloop_remove_epoll {
+    my ($self, $list, $fh) = @_;
+    my $fd = $self->{fhs}{$fh}{fd};
+
+    #print "$fh -> $fd\n";
+    #use Data::Dumper; print Dumper($self->{fds});
+   
+    #my ($package, $filename, $line, $subroutine, $hasargs, $wantarray, 
+    #    $evaltext, $is_require, $hints, $bitmask, $hinthash) = caller(0);
+    
+    my $mask = $list eq 'writefh' ? EPOLLIN : EPOLLOUT;
+    
+    $mask |= EPOLLERR|EPOLLHUP; 
+    
+    if(my $cfd = $self->{fds}{$fd}) {
+        if(($cfd->[1] & EPOLLIN and $cfd->[1] & EPOLLOUT)) {
+            $cfd->[1] = $mask;
+            #print "modrem($list): $package\::$subroutine $line : $fh : "._dumpflags($mask)."\n";
+            epoll_ctl($self->{epollfd}, EPOLL_CTL_MOD, $fd, $mask) >= 0 
+                or croak("->add($fh, ...) : epoll_ctl($self->{epollfd}, "
+                ."EPOLL_CTL_MOD, $fd, EPOLLIN): $!\n");
+        } elsif($cfd->[1] & ($list eq 'writefh' ? EPOLLOUT : EPOLLIN)) {
+            #print "remove($list): $package\::$subroutine $line : $fh : "._dumpflags($mask)."\n";
+            epoll_ctl($self->{epollfd}, EPOLL_CTL_DEL, $fd, 0);
+            delete $self->{fds}{$fd};
+        }
+    }
+}
+
+
+sub _eventloop_wait_epoll {
+    my ($self, $timeout) = @_;
+
+    $timeout = defined $timeout ? $timeout * 1000 : -1; 
+
+    # Max 100 events returned, 1s resolution
+    my $events = epoll_wait($self->{epollfd}, 100, $timeout)
+        or die "Died because of error in epoll_wait: $!";
+    
+    # Return undef if timed out.
+    return if @{$events} == 0;
+
+    my %select;
+    foreach my $event (@{$events}) {
+        my ($fh) = @{$self->{fds}{$event->[0]}};
+        #print "event: $fh\n";
+        if($event->[1] & EPOLLIN) {    
+            push(@{$select{can_read}}, $fh);
+        } elsif($event->[1] & EPOLLOUT) {
+            push(@{$select{can_write}}, $fh);
+        } elsif($event->[1] & EPOLLERR|EPOLLHUP) {
+            push(@{$select{can_read}}, $fh);
+        }
+    }
+
+    return \%select;
+}
+
 
 =head2 B<add($handle, [ %options ])>
 
@@ -550,9 +776,9 @@ sub add {
     }
 
     if (!exists $self->{listenfh}{$fh}) {
-        $self->{writefh}->add($fh);
+        _eventloop_add($self, "writefh",$fh);
     }
-    $self->{readfh}->add($fh);
+    _eventloop_add($self, "readfh", $fh);
 
     # Find out if this object has it's own recv() function else use sysread()
     if (blessed($fh) && $fh->can('recv')) {
@@ -793,10 +1019,7 @@ Returns a list of file handles managed by this object.
 
 =cut
 
-sub handles {
-    my ($self) = @_;
-    return $self->{readfh}->handles;
-}
+sub handles {  } # Stub - is created in new()
 
 =head2 B<has_events()>
 
@@ -858,8 +1081,8 @@ responsibility of closing it.
 sub remove {
     my ($self, $fh) = @_;
 
-    $self->{readfh}->remove($fh);
-    $self->{writefh}->remove($fh);
+    _eventloop_remove($self, "readfh", $fh);
+    _eventloop_remove($self, "writefh", $fh);
     delete $self->{listenfh}{$fh};
     delete $self->{fhs}{$fh};
 }
@@ -878,13 +1101,14 @@ final 'closed' event is returned.
 
 sub close {
     my ($self, $fh) = @_;
+    return if !exists $self->{fhs}{$fh}; # Only remove if we handle this fh
 
     return if $self->{fhs}{$fh}{disconnecting};
     $self->{fhs}{$fh}{disconnecting} = 1;
     
     delete $self->{listenfh}{$fh};
-    $self->{writefh}->remove($fh);
-    $self->{readfh}->remove($fh);
+    _eventloop_remove($self, "readfh", $fh);
+    _eventloop_remove($self, "writefh", $fh);
     
     $self->push_event({ type => 'closing', fh => $fh });
     
@@ -905,9 +1129,10 @@ Note: Does not return the 'read_last' event.
 
 sub kill {
     my ($self, $fh) = @_;
+    return if !exists $self->{fhs}{$fh}; # Only remove if we handle this fh
 
-    $self->{readfh}->remove($fh);
-    $self->{writefh}->remove($fh);
+    _eventloop_remove($self, "readfh", $fh);
+    _eventloop_remove($self, "writefh", $fh);
 
     $self->push_event({ type => 'closed', fh => $fh, 
             missing => $self->buflen($fh) });
@@ -1033,7 +1258,7 @@ sub sendto {
         my $rv = $self->_send_dgram($fh);
         
         if(@{$cfg->{outbuffer}}) {
-            $self->{writefh}->add($fh);
+            _eventloop_add($self, "writefh", $fh);
         }
 
         return $rv;
@@ -1043,7 +1268,7 @@ sub sendto {
         my $rv = $self->_send_stream($fh);
     
         if(length $cfg->{outbuffer}) {
-            $self->{writefh}->add($fh);
+            _eventloop_add($self, "writefh", $fh);
         }
 
         return $rv;
@@ -1058,7 +1283,7 @@ sub _send_dgram {
 
     if (@{$cfg->{outbuffer}} == 0) {
         # no data to send
-        $self->{writefh}->remove($fh);
+        _eventloop_remove($self, "writefh", $fh);
         return;
     }
 
@@ -1099,7 +1324,7 @@ sub _send_dgram {
    
     # Buffer is empty and stop listening to write
     $self->push_event({type => 'sent', fh => $fh});
-    $self->{writefh}->remove($fh);
+    _eventloop_remove($self, "writefh", $fh);
 
     return $packets_sent;
 }
@@ -1109,9 +1334,14 @@ sub _send_stream {
     my $cfg = $self->{fhs}{$fh};
     my $write = $self->{fhs}{$fh}{write};
 
+    #my ($package, $filename, $line, $subroutine, $hasargs, $wantarray, 
+    #    $evaltext, $is_require, $hints, $bitmask, $hinthash) = caller(0);
+    # 
+    #print "sendstream $line\n";
+
     if ($cfg->{outbuffer} eq '') {
         # no data to send
-        $self->{writefh}->remove($fh);
+        _eventloop_remove($self, "writefh", $fh);
         return;
     }
 
@@ -1141,12 +1371,12 @@ sub _send_stream {
     } elsif ($rv < length $cfg->{outbuffer}) {
         # only part of the data was sent
         substr($cfg->{outbuffer}, 0, $rv) = '';
-        $self->{writefh}->add($fh);
+        _eventloop_add($self, "writefh", $fh);
         
     } else {
         # all pending data was sent
         $cfg->{outbuffer} = '';
-        $self->{writefh}->remove($fh);
+        _eventloop_remove($self, "writefh", $fh);
 
         if($cfg->{ready} == 0) {
             $cfg->{ready} = 1;
@@ -1391,7 +1621,7 @@ When the other end of a pipe closes it's end, signals can get thrown. To handle
 this a signal handler needs to be defined:
 
   # Needed when writing to a broken pipe 
-  $SIG{PIPE} = sub {
+  $SIG{PIPE} = sub { # SIGPIPE
      croak "Broken pipe";
  };
 

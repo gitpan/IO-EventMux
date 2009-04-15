@@ -26,8 +26,49 @@ DESCRIPTION
     IO::Handle objects (preferred).
 
 METHODS
-  new()
+  new([%options])
     Constructs an IO::EventMux object.
+
+    The optional parameters for the handle will be taken from the
+    IO::EventMux object if not given here:
+
+   EventLoop
+    Defines what mechanism to use for the event loop, currently only two
+    build in are available; IO::Epoll and IO::Select. IO::Select being the
+    default.
+
+      my $mux = new IO::EventMux(EventLoop => [$mechanism, $args]);
+
+    IO::Epoll example for holding 1024 file handles:
+
+      my $mux = new IO::EventMux(EventLoop => ["IO::Epoll", 1024]);
+
+    It's also possible to define your own, this is done by creating a hash
+    that implements the following structure:
+
+      my $mux = new IO::EventMux(EventLoop => {
+          Add => sub { 
+            my($self, $list, $fh) = @_;
+            ...
+          },
+          Wait => sub {
+            my($self, $timeout) = @_;
+            ...
+            return {
+                can_read => [$fh, ...],
+                can_write => [$fh, ...],
+            };
+            
+      },
+          Remove => sub {
+            my($self, $list, $fh) = @_;
+            ...
+          },
+          Handles => sub {
+            my($self) = @_;
+            ...
+          },
+      });
 
   mux([$timeout])
     This method will block until ether an event occurs on one of the file
@@ -345,7 +386,7 @@ METHODS
     defined:
 
       # Needed when writing to a broken pipe 
-      $SIG{PIPE} = sub {
+      $SIG{PIPE} = sub { # SIGPIPE
          croak "Broken pipe";
      };
 
