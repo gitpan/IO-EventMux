@@ -1,6 +1,6 @@
 ---
 name: IO-EventMux
-version: 2.01
+version: 2.02
 author:
   - 'Jonas Jensen <jonas@infopro.dk>,Troels Liebe Bentsen <troels@infopro.dk>'
 abstract: |-
@@ -24,7 +24,7 @@ build_requires:
 provides:
   IO::EventMux:
     file: lib/IO/EventMux.pm
-    version: 2.01
+    version: 2.02
   IO::EventMux::Dump:
     file: lib/IO/EventMux/Dump.pm
 generated_by: Module::Build version 0.280801
